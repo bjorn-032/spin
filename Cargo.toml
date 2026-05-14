@@ -1,0 +1,13 @@
+[package]
+name = "spin"
+version = "0.1.0"
+edition = "2021"
+description = "Simple Package Installer for Nix - a friendly NixOS package manager wrapper"
+
+[[bin]]
+name = "spin"
+path = "src/main.rs"
+
+[dependencies]
+clap = "4"
+serde_json = "1"
