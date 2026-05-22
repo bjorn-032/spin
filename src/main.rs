@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::time::Instant;
 
 const PACKAGES_FILE: &str = "/etc/nixos/packages.conf";
@@ -32,6 +32,7 @@ fn main() -> ExitCode {
 
     let is_profile = matches.get_flag("profile");
     let is_temp = matches.get_flag("temp");
+    let is_font = matches.get_flag("font");
     let do_sync = matches.get_flag("sync");
     let do_upgrade = matches.get_flag("upgrade");
     let do_clean = matches.get_flag("clean");
@@ -57,6 +58,9 @@ fn main() -> ExitCode {
         return if cmd_clean(clean_all) { ExitCode::SUCCESS } else { ExitCode::FAILURE };
     }
     if is_temp {
+        if !validate_packages(&install_pkgs) {
+            return ExitCode::FAILURE;
+        }
         let nix_args: Vec<String> = ["shell", "--impure"].iter().map(|s| s.to_string())
             .chain(install_pkgs.iter().map(|p| format!("nixpkgs#{}", p)))
             .collect();
@@ -65,9 +69,17 @@ fn main() -> ExitCode {
         return if run_nix(&nix_args_ref) { ExitCode::SUCCESS } else { ExitCode::FAILURE };
     }
     if is_profile {
-        for pkg in &install_pkgs {
-            println!("[spin] Installing '{}' to user profile...", pkg);
-            if !run_nix_streaming(&["profile", "install", "--impure", &format!("nixpkgs#{}", pkg)]) {
+        if !install_pkgs.is_empty() {
+            if !validate_packages(&install_pkgs) {
+                return ExitCode::FAILURE;
+            }
+            println!("[spin] Installing {} to user profile...", install_pkgs.join(", "));
+            // One invocation for every package — a single flake lock/eval.
+            let mut nix_args: Vec<String> =
+                ["profile", "install", "--impure"].iter().map(|s| s.to_string()).collect();
+            nix_args.extend(install_pkgs.iter().map(|p| format!("nixpkgs#{}", p)));
+            let nix_args_ref: Vec<&str> = nix_args.iter().map(String::as_str).collect();
+            if !run_nix_streaming(&nix_args_ref) {
                 return ExitCode::FAILURE;
             }
         }
@@ -82,49 +94,94 @@ fn main() -> ExitCode {
         }
     }
 
-    // 3. Prepare system changes: update packages.conf only, no rebuild yet.
-    //    Track what changed so we can roll back if the rebuild fails.
+    // 3. Prepare system changes: update packages.conf in a single read/write,
+    //    no rebuild yet. `rollback` holds the pre-change lists if the file was
+    //    written, so a failed rebuild can restore it.
+    let kind = if is_font { "Font" } else { "Package" };
     let mut added: Vec<String> = Vec::new();
     let mut removed: Vec<String> = Vec::new();
+    let mut rollback: Option<(Vec<String>, Vec<String>)> = None;
 
-    for pkg in &install_pkgs {
-        match prepare_install(pkg) {
-            Ok(true)  => added.push(pkg.clone()),
-            Ok(false) => {}
-            Err(e)    => { eprintln!("[spin] Error: {}", e); return ExitCode::FAILURE; }
+    if !install_pkgs.is_empty() || !remove_pkgs.is_empty() {
+        if let Err(e) = ensure_packages_file() {
+            eprintln!("[spin] Error: {}", e);
+            return ExitCode::FAILURE;
         }
-    }
-    for pkg in &remove_pkgs {
-        match prepare_remove(pkg) {
-            Ok(())  => removed.push(pkg.clone()),
-            Err(e)  => { eprintln!("[spin] Error: {}", e); return ExitCode::FAILURE; }
+        let (mut packages, mut fonts) = match read_conf() {
+            Ok(conf) => conf,
+            Err(e) => {
+                eprintln!("[spin] Error: {}", e);
+                return ExitCode::FAILURE;
+            }
+        };
+        let snapshot = (packages.clone(), fonts.clone());
+
+        {
+            // `-f` targets the fonts.packages list, otherwise systemPackages.
+            let target = if is_font { &mut fonts } else { &mut packages };
+
+            // Only names not already present need adding (and validating).
+            let mut new_names: Vec<String> = Vec::new();
+            for pkg in &install_pkgs {
+                if target.contains(pkg) {
+                    println!("[spin] {} '{}' is already installed.", kind, pkg);
+                } else if !new_names.contains(pkg) {
+                    new_names.push(pkg.clone());
+                }
+            }
+
+            if !new_names.is_empty() && !validate_packages(&new_names) {
+                return ExitCode::FAILURE;
+            }
+
+            for pkg in new_names {
+                println!("[spin] Queued '{}' for installation.", pkg);
+                target.push(pkg.clone());
+                added.push(pkg);
+            }
+            target.sort();
+
+            for pkg in &remove_pkgs {
+                if target.contains(pkg) {
+                    target.retain(|p| p != pkg);
+                    println!("[spin] Queued '{}' for removal.", pkg);
+                    removed.push(pkg.clone());
+                } else {
+                    eprintln!(
+                        "[spin] Error: {} '{}' is not managed by spin (not in {}).",
+                        kind.to_lowercase(), pkg, PACKAGES_FILE
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+
+        // Single write covering every requested change.
+        if !added.is_empty() || !removed.is_empty() {
+            if let Err(e) = write_conf(&packages, &fonts) {
+                eprintln!("[spin] Error: {}", e);
+                return ExitCode::FAILURE;
+            }
+            rollback = Some(snapshot);
         }
     }
 
     // 4. Single rebuild — use --upgrade when that flag was given.
-    let needs_rebuild = do_upgrade || !added.is_empty() || !removed.is_empty();
+    let needs_rebuild = do_upgrade || rollback.is_some();
     if needs_rebuild {
         let flags: &[&str] = if do_upgrade { &["switch", "--upgrade"] } else { &["switch"] };
         if !run_privileged_streaming("nixos-rebuild", flags) {
-            // Roll back conf changes so the file stays consistent.
-            if !added.is_empty() {
-                let mut pkgs = read_packages().unwrap_or_default();
-                pkgs.retain(|p| !added.contains(p));
-                let _ = write_packages(&pkgs);
-            }
-            if !removed.is_empty() {
-                let mut pkgs = read_packages().unwrap_or_default();
-                pkgs.extend(removed.iter().cloned());
-                pkgs.sort();
-                let _ = write_packages(&pkgs);
+            // Restore packages.conf to its pre-change state.
+            if let Some((p, f)) = rollback {
+                let _ = write_conf(&p, &f);
             }
             eprintln!("[spin] Error: nixos-rebuild failed — changes rolled back.");
             return ExitCode::FAILURE;
         }
     }
 
-    for pkg in &added   { println!("[spin] Package '{}' installed successfully.", pkg); }
-    for pkg in &removed { println!("[spin] Package '{}' removed successfully.", pkg); }
+    for pkg in &added   { println!("[spin] {} '{}' installed successfully.", kind, pkg); }
+    for pkg in &removed { println!("[spin] {} '{}' removed successfully.", kind, pkg); }
     if do_upgrade && added.is_empty() && removed.is_empty() {
         println!("[spin] System updated successfully.");
     }
@@ -137,7 +194,7 @@ fn build_cli() -> ClapCommand {
         .bin_name("spin")
         .about("spin - Simple Package Installer for Nix")
         .long_about(
-            "spin is a friendly wrapper around NixOS package management.\n\
+            "SPIN (Simple Package Installer for Nix) is a friendly wrapper around NixOS package management.\n\
              System packages are tracked in /etc/nixos/packages.conf.\n\n\
              NOTE: Add the following line to the imports list in /etc/nixos/configuration.nix\n\
              to activate spin-managed packages:\n\
@@ -192,6 +249,14 @@ fn build_cli() -> ClapCommand {
                 .help("With -i: start a temporary nix shell with the package (not persisted)"),
         )
         .arg(
+            Arg::new("font")
+                .short('f')
+                .long("font")
+                .action(ArgAction::SetTrue)
+                .conflicts_with_all(["temp", "profile"])
+                .help("With -i/-r: install/remove fonts (fonts.packages) instead of system packages"),
+        )
+        .arg(
             Arg::new("search")
                 .short('q')
                 .long("query")
@@ -217,11 +282,14 @@ fn build_cli() -> ClapCommand {
 // ── Privilege helpers ─────────────────────────────────────────────────────────
 
 fn is_root() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
-        .unwrap_or(false)
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+            .unwrap_or(false)
+    })
 }
 
 fn run_command(program: &str, args: &[&str]) -> bool {
@@ -415,16 +483,24 @@ fn nix_output(args: &[&str]) -> Option<String> {
 
 // ── packages.conf I/O ─────────────────────────────────────────────────────────
 
-fn read_packages() -> Result<Vec<String>, String> {
+// Reads the two lists spin manages out of packages.conf:
+// environment.systemPackages and fonts.packages.
+fn read_conf() -> Result<(Vec<String>, Vec<String>), String> {
     if !Path::new(PACKAGES_FILE).exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let content = fs::read_to_string(PACKAGES_FILE)
         .map_err(|e| format!("Cannot read {}: {}", PACKAGES_FILE, e))?;
-    Ok(parse_packages(&content))
+    Ok((
+        parse_list(&content, "systemPackages"),
+        parse_list(&content, "fonts.packages"),
+    ))
 }
 
-fn parse_packages(content: &str) -> Vec<String> {
+// Collects entries from the `with pkgs; [ ... ];` block whose opening line
+// contains `marker`. The two markers are mutually exclusive substrings, so each
+// call independently finds its own block in the shared file.
+fn parse_list(content: &str, marker: &str) -> Vec<String> {
     let mut packages = Vec::new();
     let mut in_list = false;
 
@@ -432,13 +508,13 @@ fn parse_packages(content: &str) -> Vec<String> {
         let trimmed = line.trim();
 
         if !in_list {
-            if trimmed.contains("systemPackages") {
+            if trimmed.contains(marker) {
                 in_list = true;
             }
             continue;
         }
 
-        if trimmed.starts_with("];") || trimmed == "];" {
+        if trimmed.starts_with("];") {
             break;
         }
 
@@ -455,16 +531,25 @@ fn parse_packages(content: &str) -> Vec<String> {
     packages
 }
 
-fn write_packages(packages: &[String]) -> Result<(), String> {
-    let mut content = String::from(
-        "# Managed by spin - Simple Package Installer for Nix\n\
-         # Do not edit manually. Use: spin -i <package> / spin -r <package>\n\
-         { pkgs, ... }:\n\
-         {\n\
-           environment.systemPackages = with pkgs; [\n",
-    );
+fn write_conf(packages: &[String], fonts: &[String]) -> Result<(), String> {
+    let mut content = String::new();
+    content.push_str("# Managed by spin - Simple Package Installer for Nix\n");
+    content.push_str("# Do not edit manually. Use: spin -i <pkg> / -r <pkg>  (fonts: spin -fi / -fr)\n");
+    content.push_str("{ pkgs, ... }:\n{\n");
+
+    content.push_str("  environment.systemPackages = with pkgs; [\n");
     for pkg in packages {
-        content.push_str(&format!("    {}\n", pkg));
+        content.push_str("    ");
+        content.push_str(pkg);
+        content.push('\n');
+    }
+    content.push_str("  ];\n");
+
+    content.push_str("  fonts.packages = with pkgs; [\n");
+    for font in fonts {
+        content.push_str("    ");
+        content.push_str(font);
+        content.push('\n');
     }
     content.push_str("  ];\n}\n");
 
@@ -475,7 +560,7 @@ const CONFIG_FILE: &str = "/etc/nixos/configuration.nix";
 
 fn ensure_packages_file() -> Result<(), String> {
     if !Path::new(PACKAGES_FILE).exists() {
-        write_packages(&[])?;
+        write_conf(&[], &[])?;
         println!("[spin] Created {}", PACKAGES_FILE);
     }
     check_config_imports();
@@ -516,6 +601,139 @@ fn search_nixpkgs(query: &str) -> SearchMap {
     let json = nix_output(&["search", "--no-update-lock-file", "--json", "nixpkgs", query])
         .unwrap_or_default();
     serde_json::from_str(&json).unwrap_or_default()
+}
+
+// True if `s` could be a nixpkgs attribute path (also makes it safe to splice
+// into the Nix expression below without further escaping).
+fn is_attr_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
+// Top-level attribute names of nixpkgs. Unlike `nix search`, this forces only
+// the attrset keys (no per-package metadata), so it stays sub-second once
+// nixpkgs is in the eval cache.
+fn nixpkgs_attr_names() -> Vec<String> {
+    let expr = "builtins.attrNames (import <nixpkgs> { })";
+    nix_output(&["eval", "--impure", "--json", "--expr", expr])
+        .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+        .unwrap_or_default()
+}
+
+// Levenshtein edit distance between two strings.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr: Vec<usize> = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(curr[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+// Ranks `cand` as a suggestion for the mistyped `typo`; lower is better.
+// None means `cand` is too far from `typo` to be worth suggesting.
+fn suggestion_score(typo: &str, cand: &str) -> Option<usize> {
+    let typo = typo.to_lowercase();
+    let cand = cand.to_lowercase();
+    if cand == typo {
+        Some(0)
+    } else if cand.starts_with(&typo) {
+        Some(1)
+    } else if cand.contains(&typo) {
+        Some(2)
+    } else {
+        // Allow more slack for longer names; never suggest wild guesses.
+        let dist = edit_distance(&typo, &cand);
+        (dist <= (typo.len() / 3).max(2)).then_some(3 + dist)
+    }
+}
+
+// Verifies every name resolves to a real nixpkgs attribute *before* a rebuild.
+//
+// `nix search` is slow because it forces every package's metadata. Both the
+// existence check and the typo suggestions avoid it: existence is one
+// `nix eval` with `lib.hasAttrByPath`, and suggestions match locally against
+// nixpkgs' top-level attribute names — both only inspect attrset keys, so they
+// stay sub-second once nixpkgs is in the eval cache.
+//
+// Returns true if all names are valid; prints errors + suggestions otherwise.
+// If nix itself cannot be queried, validation is skipped (warns, does not block).
+fn validate_packages(names: &[String]) -> bool {
+    let mut missing: Vec<&str> = Vec::new();
+    let checkable: Vec<&str> = names
+        .iter()
+        .filter_map(|n| {
+            if is_attr_name(n) {
+                Some(n.as_str())
+            } else {
+                missing.push(n.as_str());
+                None
+            }
+        })
+        .collect();
+
+    if !checkable.is_empty() {
+        let list = checkable
+            .iter()
+            .map(|n| format!("\"{}\"", n))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let expr = format!(
+            "let pkgs = import <nixpkgs> {{ }}; lib = pkgs.lib; names = [ {} ]; \
+             in builtins.listToAttrs (map (n: {{ name = n; \
+             value = lib.hasAttrByPath (lib.splitString \".\" n) pkgs; }}) names)",
+            list
+        );
+
+        let parsed = nix_output(&["eval", "--impure", "--json", "--expr", expr.as_str()])
+            .and_then(|json| {
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json).ok()
+            });
+
+        match parsed {
+            Some(map) => {
+                for name in &checkable {
+                    if map.get(*name).and_then(|v| v.as_bool()) != Some(true) {
+                        missing.push(name);
+                    }
+                }
+            }
+            None => {
+                eprintln!("[spin] Warning: could not reach nixpkgs to validate names — skipping check.");
+            }
+        }
+    }
+
+    if missing.is_empty() {
+        return true;
+    }
+
+    // Only on an actual typo: suggest close attribute names. We match locally
+    // against nixpkgs' top-level attribute names (cheap — keys only) rather
+    // than `nix search`, which forces every package's metadata.
+    let attrs = nixpkgs_attr_names();
+    for name in &missing {
+        eprintln!("[spin] Error: '{}' was not found in nixpkgs.", name);
+        let mut suggestions: Vec<(usize, usize, &str)> = attrs
+            .iter()
+            .filter_map(|attr| Some((suggestion_score(name, attr)?, attr.len(), attr.as_str())))
+            .collect();
+        suggestions.sort();
+        suggestions.truncate(5);
+        if !suggestions.is_empty() {
+            let names: Vec<&str> = suggestions.iter().map(|&(_, _, p)| p).collect();
+            eprintln!("       Did you mean: {}?", names.join(", "));
+        }
+    }
+    false
 }
 
 
@@ -573,44 +791,6 @@ fn cmd_clean(all: bool) -> bool {
     }
     println!("[spin] Updating bootloader...");
     run_privileged_streaming("nixos-rebuild", &["boot"])
-}
-
-// ── System package operations ─────────────────────────────────────────────────
-
-// Adds the package to packages.conf. Does NOT search or rebuild.
-// Returns Ok(true) if added, Ok(false) if already present.
-fn prepare_install(name: &str) -> Result<bool, String> {
-    ensure_packages_file()?;
-
-    let mut packages = read_packages()?;
-
-    if packages.contains(&name.to_string()) {
-        println!("[spin] Package '{}' is already installed.", name);
-        return Ok(false);
-    }
-
-    packages.push(name.to_string());
-    packages.sort();
-    write_packages(&packages)?;
-    println!("[spin] Queued '{}' for installation.", name);
-    Ok(true)
-}
-
-// Removes the package from packages.conf. Does NOT rebuild.
-fn prepare_remove(name: &str) -> Result<(), String> {
-    let mut packages = read_packages()?;
-
-    if !packages.contains(&name.to_string()) {
-        return Err(format!(
-            "Package '{}' is not managed by spin (not in {}).",
-            name, PACKAGES_FILE
-        ));
-    }
-
-    packages.retain(|p| p != name);
-    write_packages(&packages)?;
-    println!("[spin] Queued '{}' for removal.", name);
-    Ok(())
 }
 
 // ── Profile package operations ────────────────────────────────────────────────

@@ -24,6 +24,7 @@ spin [FLAGS] [OPTIONS]
 | `--upgrade` | `-u` | Upgrade all system packages |
 | `--profile` | `-p` | Target the current user's Nix profile instead of the system |
 | `--temp` | `-t` | Open a temporary `nix shell` with the package (not persisted) |
+| `--font` | `-f` | With `-i`/`-r`: install/remove fonts (`fonts.packages`) instead of system packages |
 | `--query <pkg>...` | `-q` | Search nixpkgs for one or more packages |
 | `--clean` | `-c` | Delete generations older than 7 days and update bootloader |
 | `--all` | | With `--clean`: delete ALL old generations instead of just >7d |
@@ -48,6 +49,12 @@ spin -pi helix
 # Try a package without installing it
 spin -ti cowsay
 
+# Install fonts (added to fonts.packages so fontconfig picks them up)
+spin -fi fira-code noto-fonts
+
+# Remove a font
+spin -fr fira-code
+
 # Remove a package
 spin -r htop
 
@@ -66,9 +73,11 @@ spin -c --all
 1. `--sync` updates Nix channels (`nix-channel --update`)
 2. `--query` queries nixpkgs and prints matching packages with versions and descriptions
 3. `--clean` runs `nix-collect-garbage` to delete old generations, then `nixos-rebuild boot` to update the bootloader; `--all` removes all old generations instead of just those older than 7 days
-4. All install targets are validated with a single `nix search` query; suggests alternatives if a name is not found
-5. `packages.conf` is updated
+4. Install targets are validated up front with a single fast `nix eval` (an attribute-existence check, not a full `nix search`); on a typo it suggests alternatives and aborts before any rebuild
+5. `packages.conf` is updated in one write — system packages go to `environment.systemPackages`, fonts (`-f`) to `fonts.packages`
 6. `nixos-rebuild switch` is run once; on failure, `packages.conf` is rolled back
+
+`packages.conf` holds both an `environment.systemPackages` block and a `fonts.packages` block, so a single `./packages.conf` import covers both — no extra setup for fonts.
 
 ## Build
 
